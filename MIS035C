@@ -1,0 +1,190 @@
+#%%
+import os
+from contextlib import contextmanager
+
+@contextmanager
+def working_directory(directory):
+    owd = os.getcwd()
+    try:
+        os.chdir(directory)
+        yield directory
+    finally:
+        os.chdir(owd)
+        
+import pip
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+from scipy.stats import norm
+from sklearn.preprocessing import StandardScaler
+from scipy import stats
+import warnings
+warnings.filterwarnings('ignore')
+from sklearn.linear_model import ElasticNet, Lasso,  BayesianRidge, LassoLarsIC
+from sklearn.ensemble import RandomForestRegressor,  GradientBoostingRegressor
+from sklearn.kernel_ridge import KernelRidge
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import RobustScaler
+from sklearn.base import BaseEstimator, TransformerMixin, RegressorMixin, clone
+from sklearn.model_selection import KFold, cross_val_score, train_test_split
+from sklearn.metrics import mean_squared_error
+import xgboost as xgb
+import lightgbm as lgb
+import shelve
+from datetime import date
+from datetime import datetime
+from datetime import timedelta
+import time
+import array as arr
+import math
+import re
+from openpyxl import load_workbook
+
+start=time.time()
+pd.set_option('max_columns', None)#Set to show all columns
+
+#Parameter setup
+date_rp=datetime(2020,12,17)
+RM_array=arr.array('i',[-10000,0,1,7,30,60,90,180,270,365,730,1095,1460,1825,3650,30000])
+RPC_array=arr.array('i',[-10000,0,1,7,14,21,30,60,90,180,270,365,1095,1825,30000])
+MCO_array=arr.array('i',[-10000,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,21,30,37,44,51,60,90,180,270,365,1825,210000])
+
+
+#Read & Edit file Y
+file_Y=pd.read_csv('./Y.csv',parse_dates=['MATURITY_DATE','SCHEDULE_DUE_DATE','MIN_INT_REVN_DATE'])
+file_N=pd.read_csv('./N.csv',parse_dates=['MATURITY_DATE','SCHEDULE_DUE_DATE','MIN_INT_REVN_DATE'])
+#Append N & Y, ignoring N's columns
+file_N.columns = file_Y.columns
+file_consol = pd.concat([file_N,file_Y], ignore_index=True)
+#Delete N & Y after use
+del file_Y
+del file_N
+
+#Delete unused columns
+col_list_del=['MODULE','RATE','BACKUP_DATE','LINE_CODE','NGANH_NGHE_KINH_TE','LOAI_HINH_KINH_TE','MUC_DICH_VAY','MUCDICH_VAY_CUTHE','TENOR','SECURED','RATE','CUSTOMER_TYPE','LCY_OUTSTANDING']
+for col in col_list_del:
+    try:
+        del file_consol[col]
+    except  Exception:
+       pass
+
+#Type conversions
+for column in file_consol:
+   try:
+       file_consol[column]=file_consol[column].str.replace('="','')
+       file_consol[column]=file_consol[column].str.replace('"','')
+   except  Exception:
+      pass
+
+col_list_int=['ACCOUNT_HEAD','BRANCH_CODE']
+for col in col_list_int:
+   file_consol[col]=file_consol[col].astype(int)
+del col_list_del,col_list_int,col,column
+
+#Add maturity dates to NaN in RPC Columns
+file_consol.MIN_INT_REVN_DATE.fillna(file_consol.SCHEDULE_DUE_DATE, inplace=True)
+file_consol.loc[file_consol['MIN_INT_REVN_DATE'] > file_consol['SCHEDULE_DUE_DATE'], 'MIN_INT_REVN_DATE'] = file_consol['SCHEDULE_DUE_DATE']
+
+#Drop unused rows
+file_consol =file_consol[(file_consol['ACCOUNT_HEAD']/100000000).astype(int) != 9] #Drop acc head = 9
+file_consol =file_consol[(file_consol['ACCOUNT_HEAD']/1000).astype(int) != 211102] #Drop overdraft acc
+file_consol =file_consol[file_consol['BRANCH_CODE'] != 444] #Drop 444 branch
+file_consol =file_consol[((file_consol['ACCOUNT_HEAD']/100000000).astype(int) == 2) | ((file_consol['ACCOUNT_HEAD']/10000000).astype(int) == 37)] #Drop acc head = 3 and <> 37
+
+
+#Generate new columns
+file_consol['RM_LIQUIDITY']=(file_consol['SCHEDULE_DUE_DATE'] - date_rp).dt.days #Liquidity
+file_consol['RM_RPC']=(file_consol['MIN_INT_REVN_DATE'] - date_rp).dt.days #RPC
+file_consol['Loan_Group'] = round(file_consol['ACCOUNT_HEAD'] % 1000000)/100000 #Loan group
+file_consol['Loan_Group']=file_consol['Loan_Group'].astype(int)
+file_consol['PRODUCT_CODE']=file_consol['ACCOUNT_NUMBER'].str.slice(3,7)
+
+#Create new MCO columns
+def inf_rate(word: str):
+    if word.startswith('H') or word.startswith('L') or word.startswith('M'): 
+        out = 1.0
+    elif word == 'SVND' or word == 'SAVL':
+        out = 0.1
+    else:
+        out = 0.5
+    return out
+file_consol['INFLOW_RATE'] = file_consol['PRODUCT_CODE'].apply(inf_rate)
+file_consol.loc[file_consol['Loan_Group'] != 1, 'INFLOW_RATE'] = 0
+file_consol['INFLOW_AMT']=file_consol['INFLOW_RATE']*file_consol['OUTSTANDING']
+
+#Create new dataframes
+LQDT_DF=pd.DataFrame(columns=list(range(1,11)), index=RM_array)
+RPC_DF=pd.DataFrame(columns=list(range(1,11)), index=RPC_array)
+MCO_DF=pd.DataFrame(0,columns=MCO_array, index=['Cum.VND','Cum.USD'])
+Loan_DF=pd.DataFrame(columns=['VND','USD'], index=list(range(1,6)))
+
+for j in range(1,6):
+   Loan_grp_VND=file_consol[(file_consol["Loan_Group"]==j) & (file_consol["CCY"]=="VND")]
+   Loan_grp_USD=file_consol[(file_consol["Loan_Group"]==j) & (file_consol["CCY"]=="USD")]
+   Loan_sumif_VND=Loan_grp_VND["OUTSTANDING"].sum()
+   Loan_sumif_USD=Loan_grp_USD["OUTSTANDING"].sum()
+   Loan_DF.iloc[j-1,0]=Loan_sumif_VND
+   Loan_DF.iloc[j-1,1]=Loan_sumif_USD
+   for i in range(1,len(RM_array)):
+       #Liquidity
+       LQDT_data_VND=file_consol[(file_consol["Loan_Group"]==j) & (file_consol["CCY"]=="VND") & (file_consol["RM_LIQUIDITY"]>RM_array[i-1]) & (file_consol["RM_LIQUIDITY"]<=RM_array[i])]
+       LQDT_data_USD=file_consol[(file_consol["Loan_Group"]==j) & (file_consol["CCY"]=="USD") & (file_consol["RM_LIQUIDITY"]>RM_array[i-1]) & (file_consol["RM_LIQUIDITY"]<=RM_array[i])]
+       LQDT_sumif_VND=LQDT_data_VND["OUTSTANDING"].sum()
+       LQDT_sumif_USD=LQDT_data_USD["OUTSTANDING"].sum()
+       LQDT_DF.iloc[i,(2*j-2)]=LQDT_sumif_VND
+       LQDT_DF.iloc[i,(2*j-1)]=LQDT_sumif_USD
+       #Repricing
+   for k in range(1,len(RPC_array)):
+       RPC_data_VND=file_consol[(file_consol["Loan_Group"]==j) & (file_consol["CCY"]=="VND") & (file_consol["RM_RPC"]>RPC_array[k-1]) & (file_consol["RM_RPC"]<=RPC_array[k])]
+       RPC_data_USD=file_consol[(file_consol["Loan_Group"]==j) & (file_consol["CCY"]=="USD") & (file_consol["RM_RPC"]>RPC_array[k-1]) & (file_consol["RM_RPC"]<=RPC_array[k])]
+       RPC_sumif_VND=RPC_data_VND["OUTSTANDING"].sum()
+       RPC_sumif_USD=RPC_data_USD["OUTSTANDING"].sum()
+       RPC_DF.iloc[k,(2*j-2)]=RPC_sumif_VND
+       RPC_DF.iloc[k,(2*j-1)]=RPC_sumif_USD
+del RPC_data_VND,RPC_data_USD,LQDT_data_VND,LQDT_data_USD,Loan_grp_VND,Loan_grp_USD
+
+#MCO Calculation
+for m in range(1,len(MCO_array)):
+    MCO_data_VND=file_consol[(file_consol["CCY"]=="VND") & (file_consol["RM_LIQUIDITY"]<=MCO_array[m])]
+    MCO_data_USD=file_consol[(file_consol["CCY"]=="USD") & (file_consol["RM_LIQUIDITY"]<=MCO_array[m])]
+    MCO_cum_VND=MCO_data_VND["INFLOW_AMT"].sum()
+    MCO_cum_USD=MCO_data_USD["INFLOW_AMT"].sum()
+    MCO_DF.iloc[0,m]=MCO_cum_VND#Cum. VND
+    MCO_DF.iloc[1,m]=MCO_cum_USD#Cum. USD
+del MCO_data_VND,MCO_data_USD
+
+#Generate excel file
+#Generate excel file
+MISC_Output=pd.ExcelWriter("MISC_Output.xlsx", engine = 'openpyxl')
+Export_file=load_workbook("MISC_Output.xlsx")
+MISC_Output.book = Export_file
+MISC_Output.sheets = dict((ws.title, ws) for ws in Export_file.worksheets)#List existing sheets
+
+LQDT_DF.to_excel(MISC_Output, sheet_name = 'Liquidity',index=True)
+RPC_DF.to_excel(MISC_Output, sheet_name = 'Repricing',index=True)
+MCO_DF.iloc[[0]].to_excel(MISC_Output, sheet_name = 'MCO',index=False, header=False,
+           startcol=1,startrow=1)
+MCO_DF.iloc[[1]].to_excel(MISC_Output, sheet_name = 'MCO',index=False, header=False,
+           startcol=1,startrow=3)
+Loan_DF.to_excel(MISC_Output, sheet_name='MCO', header=None, index=True,
+             startcol=31,startrow=1)
+MISC_Output.save()
+end=time.time()
+print((end-start)/60)
+#%%
+
+
+
+#%%
+
+#Viewing
+file_consol.head(5) #Show first 5 cols
+print(file_consol[['Loan_Group']].dtypes)#Check data type
+file_consol[['ACCOUNT_HEAD','Loan_Group']].loc[55000:55100,] #Show specific columns & rows of dataframe
+pd.DataFrame(file_consol['ACCOUNT_HEAD'].unique()).to_excel('output.xlsx',sheet_name='Sheet2',index=False) #Show unique values of specific column
+pd.DataFrame(file_N['ACCOUNT_HEAD'].unique()).to_excel('output.xlsx',sheet_name='Sheet3',index=False) #Show unique values of specific column
+
+file_consol[['Loan_Group','PRODUCT_CODE','OUTSTANDING','INFLOW_RATE','INFLOW_AMT']].iloc[400:600,:]
+#%%
