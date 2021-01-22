@@ -1,0 +1,239 @@
+#%% 0- Import libraries
+import os
+from contextlib import contextmanager
+
+@contextmanager
+def working_directory(directory):
+    owd = os.getcwd()
+    try:
+        os.chdir(directory)
+        yield directory
+    finally:
+        os.chdir(owd)
+        
+import pip
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+from scipy.stats import norm
+from sklearn.preprocessing import StandardScaler
+from scipy import stats
+import warnings
+warnings.filterwarnings('ignore')
+from sklearn.linear_model import ElasticNet, Lasso,  BayesianRidge, LassoLarsIC
+from sklearn.ensemble import RandomForestRegressor,  GradientBoostingRegressor
+from sklearn.kernel_ridge import KernelRidge
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import RobustScaler
+from sklearn.base import BaseEstimator, TransformerMixin, RegressorMixin, clone
+from sklearn.model_selection import KFold, cross_val_score, train_test_split
+from sklearn.metrics import mean_squared_error
+import shelve
+from datetime import date
+from datetime import datetime
+from datetime import timedelta
+import time
+import array as arr
+import math
+import re
+from openpyxl import load_workbook
+import win32com.client 
+
+#Parameter setup
+start=time.time()
+date_rp=datetime(2021,1,21)
+date_rp_text='21/1/2020'
+deposit_insure=75000000
+pd.set_option('max_columns', None)#Set to show all columns
+
+#Run VBA
+xlmain=win32com.client.Dispatch("Excel.Application")
+wb = xlmain.Workbooks.Open(os.path.abspath("NSFR report.xlsm"))
+xlmain.Application.Run("'NSFR Report.xlsm'!Module1.main")
+wb.Close(SaveChanges=1)
+xlmain.Application.Quit()
+del xlmain
+
+
+#Open MISA
+File_MISA_1=pd.read_csv('./MIS035A1.csv',parse_dates=['MATURITY_DATE','VALUE_DATE'])
+File_MISA_2=pd.read_csv('./MIS035A2.csv',parse_dates=['MATURITY_DATE','VALUE_DATE'])
+File_MISA_2.columns=File_MISA_1.columns
+File_MISA_consol=pd.concat([File_MISA_1,File_MISA_2],ignore_index=True)
+del File_MISA_1,File_MISA_2
+
+
+col_list_del=['BACKUP_DATE','CUST_AC_NO','CUST_CLASSIFICATION',
+              'CUST_NAME','CUST_CATEGORY','LOAITCTD','INT_START_DATE',
+              'RATE','NGUOI_GIOI_THIEU','ACCRUED_IC','GL_DU_CHI','CG_SEGMT',
+              'AC1_SEGMT','AC1_SEGMT_DES','ACCOUNT_CLASS','CT_CASA','ANR',
+              'KY_HAN_GUI']
+for col in col_list_del:
+    try:
+        del File_MISA_consol[col]
+    except  Exception:
+       pass
+del col_list_del
+#Remove =" characters
+for column in File_MISA_consol:
+   try:
+       File_MISA_consol[column]=File_MISA_consol[column].str.replace('="','')
+       File_MISA_consol[column]=File_MISA_consol[column].str.replace('"','')
+   except  Exception:
+      pass
+  
+File_MISA_consol['MATURITY_DATE']=File_MISA_consol['MATURITY_DATE'].fillna(date_rp)
+File_MISA_consol['R_MATURITY']=(File_MISA_consol['MATURITY_DATE']-date_rp).dt.days
+
+#Get stable deposits for indiv.
+File_MISA_consol['STABLE_DEPOSIT']=np.minimum(deposit_insure,
+             File_MISA_consol['LCY_CURR_BALANCE'])
+File_MISA_consol.loc[File_MISA_consol['CUSTOMER_TYPE']=='C','STABLE_DEPOSIT'] = 0
+
+#Get GTCG
+File_GTCG=File_MISA_consol[(File_MISA_consol['GLCODE'].str.match(r'43+.')) & 
+                           (File_MISA_consol['BRANCH_CODE']=='099')]
+GTCG_temp=File_GTCG.pivot_table(values=['LCY_CURR_BALANCE'], 
+                      index=pd.cut(File_GTCG["R_MATURITY"],bins=[0,364,np.inf]),
+                      columns='CCY',fill_value=0,aggfunc='sum')
+GTCG_summary=pd.DataFrame(GTCG_temp)
+GTCG_summary.columns = GTCG_summary.columns.droplevel(0) #remove column level
+
+#Get Tier 2
+File_Tier2=File_MISA_consol[File_MISA_consol['GLCODE']=='431005000']
+File_Tier2.drop(['BRANCH_CODE','CIF','ACY_CURR_BALANCE','ACY_CURR_BALANCE','CUSTOMER_TYPE',
+                 'R_MATURITY','STABLE_DEPOSIT'],axis=1, inplace=True)
+#get normal deposits: remove 43 from file
+File_MISA_consol=File_MISA_consol[~(File_MISA_consol['GLCODE'].str.match(r'43+.'))]#Remove '43' GL Code
+File_MISA_consol.assign(CCY_Cat=np.where((File_MISA_consol.CCY=='USD') | (File_MISA_consol.CCY=='VND'),
+                        File_MISA_consol.CCY,'Others'))
+
+MISA_temp=File_MISA_consol.assign(CCY_Cat=np.where((File_MISA_consol.CCY=='USD') | (File_MISA_consol.CCY=='VND'),
+        File_MISA_consol.CCY,'Others')).pivot_table(values=['LCY_CURR_BALANCE','STABLE_DEPOSIT'], 
+        index=pd.cut(File_MISA_consol["R_MATURITY"],bins=[np.NINF,0,364,np.inf]),
+        columns=['CCY_Cat','CUSTOMER_TYPE'],fill_value=0,aggfunc='sum')
+                                                    
+MISA_summary=pd.DataFrame(MISA_temp)
+MISA_summary.columns = MISA_summary.columns.droplevel(0) #remove column level
+MISA_summary.columns = MISA_summary.columns.droplevel(0) #remove amount
+MISA_summary.drop(['B'],axis=1,inplace=True)
+
+
+del MISA_temp, File_MISA_consol, col, deposit_insure, File_GTCG, column
+
+#1- Import and clean MS File and MISB
+#Read & Edit MS_File
+File_MS=pd.read_csv('./MS_File.csv')
+col_del = np.r_[0:3,5:9,10:12,13:16,17:20,21:23,24:30,31:36,37:50,51:117]#Numpy.r- translate slice object to concat
+File_MS.drop(File_MS.iloc[:,col_del],axis=1,inplace=True)#Inplace true: drop from data
+File_MS.rename(columns={'INSTRUMENT_NBR': 'ACCOUNT_NUMBER','EXPOSURE_SUB_TYPE_CODE': 'MODULE'}, inplace=True)
+File_MS['ACCOUNT_NUMBER']=File_MS['ACCOUNT_NUMBER'].apply(lambda x: int(x) if (str(x).isdigit()) else x)
+File_MS['OUTSTANDING_LCY_AMT']=pd.to_numeric(File_MS['OUTSTANDING_LCY_AMT'],errors='coerce',downcast='float')
+File_MS=File_MS.dropna(subset=['ACCOUNT_NUMBER'])
+File_MS_FICO=File_MS[(File_MS['MODULE'] == 'FICO') & ((File_MS['PERFORMING_STATUS']==1) | (File_MS['PERFORMING_STATUS']==2))]
+del col_del
+
+
+#Consolidate File Y and N- MISC
+file_Y=pd.read_csv('./Y.csv',parse_dates=['MATURITY_DATE','SCHEDULE_DUE_DATE','MIN_INT_REVN_DATE'])
+file_N=pd.read_csv('./N.csv',parse_dates=['MATURITY_DATE','SCHEDULE_DUE_DATE','MIN_INT_REVN_DATE'])
+#Append N & Y, ignoring N's columns
+file_N.columns = file_Y.columns
+file_consol = pd.concat([file_N,file_Y], ignore_index=True)
+#Delete N & Y after use
+del file_Y
+del file_N
+
+#Delete unused columns
+col_list_del=['MODULE','RATE','BACKUP_DATE','LINE_CODE','NGANH_NGHE_KINH_TE','LOAI_HINH_KINH_TE','MUC_DICH_VAY','MUCDICH_VAY_CUTHE','TENOR','SECURED','RATE']
+for col in col_list_del:
+    try:
+        del file_consol[col]
+    except  Exception:
+       pass
+
+#Remove =" characters
+for column in file_consol:
+   try:
+       file_consol[column]=file_consol[column].str.replace('="','')
+       file_consol[column]=file_consol[column].str.replace('"','')
+   except  Exception:
+      pass
+
+#Type conversions to int
+col_list_int=['ACCOUNT_HEAD','BRANCH_CODE']
+for col in col_list_int:
+   file_consol[col]=file_consol[col].astype(int, errors = 'ignore')
+   
+file_consol['ACCOUNT_NUMBER']=file_consol['ACCOUNT_NUMBER'].apply(lambda x: int(x) if (str(x).isdigit()) else x)
+del col_list_del,col_list_int,col,column
+
+
+#Drop unused rows
+file_consol=file_consol[((file_consol['ACCOUNT_HEAD']/100000000).astype(int) != 9)]
+file_consol=file_consol[file_consol['BRANCH_CODE'] != 444] #Drop acc head = 9
+file_consol=file_consol[((file_consol['ACCOUNT_HEAD']/100000000).astype(int) == 2) | ((file_consol['ACCOUNT_HEAD']/10000000).astype(int) == 37)] #Drop acc head = 3 and <> 37
+
+#Generate new columns
+file_consol['RM_LIQUIDITY']=(file_consol['SCHEDULE_DUE_DATE'] - date_rp).dt.days #Liquidity
+file_consol['Loan_Group'] = round(file_consol['ACCOUNT_HEAD'] % 1000000)/100000 #Loan group
+file_consol['Loan_Group']=file_consol['Loan_Group'].astype(int)
+
+#Get performing loans
+file_consol_P=file_consol[(file_consol['Loan_Group']==1) | (file_consol['Loan_Group']==2)]
+del file_consol
+
+#Vlookup MISC- MS File  
+file_consol_M1 = pd.merge(file_consol_P,File_MS, on ='ACCOUNT_NUMBER', how ='left')
+file_consol_M1['RM_LIQUIDITY'].fillna(0,inplace=True)
+del File_MS, file_consol_P
+
+#Fill assumed Class & Risk weight
+class_map = {'I': 'CLASS_REG_RETAIL', 'C': 'CLASS_CORP'}
+RWA_map = {'I':0.75, 'C': 1}
+file_consol_M1['ASSET_CLASS_FINAL'] = file_consol_M1['ASSET_CLASS_FINAL'].fillna(file_consol_M1['CUSTOMER_TYPE'].map(class_map))
+file_consol_M1['RISK_WEIGHT_FINAL'] = file_consol_M1['RISK_WEIGHT_FINAL'].fillna(file_consol_M1['CUSTOMER_TYPE'].map(RWA_map))
+
+#Pivot
+Loan_temp=file_consol_M1.pivot_table(values='LCY_OUTSTANDING',
+                      index='ASSET_CLASS_FINAL',
+                      columns=['CCY_x',pd.cut(file_consol_M1['RISK_WEIGHT_FINAL'],bins=[np.NINF,0.35,np.inf]),
+                               pd.cut(file_consol_M1['RM_LIQUIDITY'],bins=[np.NINF,364,np.inf])],
+                      fill_value=0,aggfunc='sum')
+
+FICO_temp=File_MS_FICO.pivot_table(values='OUTSTANDING_LCY_AMT',
+                      index='ASSET_CLASS_FINAL',columns=['CCY',pd.cut(File_MS_FICO['RESIDUAL_MATURITY'],
+                      bins=[np.NINF,12,np.inf])],fill_value=0,aggfunc='sum')
+
+Loan_summary=pd.DataFrame(Loan_temp)
+Loan_summary.columns = Loan_summary.columns.droplevel(0) #remove column level
+Loan_summary.columns = Loan_summary.columns.droplevel(0) #remove column level
+
+FICO_summary=pd.DataFrame(FICO_temp)
+FICO_summary.columns = FICO_summary.columns.droplevel(0) #remove column level
+
+#Get undrawn off-balance sheet commitments
+
+#Write to existing excel file
+NSFR_Output=pd.ExcelWriter("NSFR report.xlsm",engine='openpyxl')
+Export_file=load_workbook("NSFR report.xlsm", keep_vba=True)
+NSFR_Output.book=Export_file
+NSFR_Output.sheets=dict((ws.title, ws) for ws in Export_file.worksheets)
+NSFR_Output.sheets['TH NSFR'].cell(row=2,column=3).value=date_rp
+Loan_summary.to_excel(NSFR_Output, sheet_name='MS_File', index=True, header=False,
+                        startcol=3, startrow=3)
+MISA_summary.to_excel(NSFR_Output, sheet_name='TH MISA', index=False, header=False,
+                        startcol=3, startrow=3)
+FICO_summary.to_excel(NSFR_Output, sheet_name='MS_File', index=True, header=False,
+                        startcol=3, startrow=20)
+GTCG_summary.to_excel(NSFR_Output, sheet_name='TH MISA', index=False, header=False,
+                        startcol=3, startrow=10)
+File_Tier2.to_excel(NSFR_Output, sheet_name='Sub loans', index=False, header=False,
+                        startcol=0, startrow=2)
+NSFR_Output.save()
+end=time.time()
+print((end-start)/60)
+#%%
+
+
